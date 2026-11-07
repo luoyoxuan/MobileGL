@@ -1,0 +1,153 @@
+name: MobileGL Magma Only APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      abis:
+        description: 'arm64-v8a'
+        required: false
+        default: 'arm64-v8a'
+  push:
+    branches:
+      - dev
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+env:
+  MOBILEGL_GPU_HANG_BUDGET_MS: "0"
+  MOBILEGL_CI_DISAGGREGATED: "OFF"
+  MOBILEGL_BACKEND_TYPE: DirectVulkan
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPRESS: "true"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 4G
+      CCACHE_NOHASHDIR: "true"
+      MOBILEGL_CMAKE_COMPILER_LAUNCHER: ccache
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set artifact metadata
+        run: |
+          echo "date_today=$(date +'%Y-%m-%d')" >> "$GITHUB_ENV"
+          ABIS="${{ github.event.inputs.abis }}"
+          if [ -z "$ABIS" ]; then ABIS="arm64-v8a"; fi
+          echo "ABIS=${ABIS}" >> "$GITHUB_ENV"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: 8.10.2
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v5
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-magma-apk-ccache-v1
+          restore-keys: |
+            ${{ runner.os }}-magma-apk-ccache-
+
+      - name: Install ccache
+        timeout-minutes: 15
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y ccache
+          ccache --version
+
+      - name: Setup Android SDK
+        id: netsetup
+        continue-on-error: true
+        timeout-minutes: 15
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: false
+          packages: platform-tools
+          cmdline-tools-version: 13114758
+
+      - name: Setup Android SDK (retry)
+        timeout-minutes: 15
+        if: ${{ steps.netsetup.outcome == 'failure' }}
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: false
+          packages: platform-tools
+          cmdline-tools-version: 13114758
+
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses >/dev/null
+
+      - name: Install Android NDK
+        timeout-minutes: 30
+        run: |
+          for attempt in 1 2 3; do
+            sdkmanager "ndk;27.3.13750724" && break
+            [ "$attempt" = 3 ] && exit 1
+            echo "sdkmanager attempt $attempt failed; retrying"; sleep 20
+          done
+          echo "ndk.dir=$ANDROID_HOME/ndk/27.3.13750724" >> android-plugin/local.properties
+
+      - name: Update glslang external sources
+        working-directory: 3rdparty/glslang
+        run: python update_glslang_sources.py
+
+      - name: Build Magma-only plugin APK
+        run: >-
+          gradle --no-daemon -p android-plugin :app:assemblePluginRelease
+          -Pmobilegl.abis="${ABIS}"
+          -Pmobilegl.apkSuffix="magma-${GITHUB_SHA}"
+          -Pmobilegl.logLevel=MOBILEGL_LOG_LEVEL_INFO
+          -Pmobilegl.buildDisaggregated="${MOBILEGL_CI_DISAGGREGATED}"
+          -Pmobilegl.buildDisaggregatedInproc="${MOBILEGL_CI_DISAGGREGATED}"
+          --parallel --max-workers "$(nproc)"
+        env:
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+
+      - name: Show ccache stats
+        if: always()
+        run: ccache --show-stats || true
+
+      - name: Save ccache
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-magma-apk-ccache-v1
+
+      - name: Verify APK produced
+        run: |
+          apk="android-plugin/app/build/outputs/apk/plugin/release/MobileGL-plugin-release-magma-${GITHUB_SHA}.apk"
+          ls -l android-plugin/app/build/outputs/apk/plugin/release/ || true
+          test -f "$apk" || { echo "::error::未找到预期 APK: $apk"; exit 1; }
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n 1)"
+          "$APKSIGNER" verify --verbose "$apk" || echo "::warning::APK 未通过签名校验（可能使用了调试签名）"
+
+      - name: Upload Magma-only APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: MobileGL-magma-only-${{ env.date_today }}-${{ github.sha }}
+          path: android-plugin/app/build/outputs/apk/plugin/release/MobileGL-plugin-release-magma-${{ github.sha }}.apk
+          archive: false
+          if-no-files-found: error
